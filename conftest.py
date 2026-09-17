@@ -8,11 +8,16 @@ import sys
 import time
 from io import TextIOWrapper
 from pathlib import Path
-from typing import Generator
+from typing import Generator, cast
 
 import pytest
 import requests
-from playwright.sync_api import Browser, Playwright, APIRequestContext
+from playwright.sync_api import (
+    Browser,
+    Error as PlaywrightError,
+    Playwright,
+    APIRequestContext,
+)
 
 from common import DATA_DIR
 from common.sharly_chess_config import SharlyChessConfig
@@ -67,6 +72,16 @@ class BackendServer:
 
     def start(self):
         """Start the backend server."""
+
+        # A server left over from a previous run still answers on the port,
+        # and _wait_for_server would take it for the one started here: the
+        # suite would then run against its stale events and fail on names it
+        # believes are already used.
+        if not self._wait_for_free_port():
+            raise RuntimeError(
+                f'Port {self.port} is already in use: stop whatever is '
+                'listening on it before running the tests.'
+            )
 
         # Add src directory to PYTHONPATH for server to find modules
         current_pythonpath = env.get('PYTHONPATH', '')
@@ -185,8 +200,8 @@ class BackendServer:
         else:
             self.process.terminate()
 
-    def _wait_for_port_release(self):
-        """Block until the port can be bound again.
+    def _wait_for_free_port(self) -> bool:
+        """Block until the port can be bound, and say whether it came free.
 
         Waiting on the process is not enough: the socket outlives it
         briefly, and a suite that starts a server per run would race its
@@ -198,10 +213,14 @@ class BackendServer:
                 probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     probe.bind((self.host, self.port))
-                    return
+                    return True
                 except OSError:
                     time.sleep(0.1)
-        print(f'Warning: port {self.port} still in use after stopping the server')
+        return False
+
+    def _wait_for_port_release(self):
+        if not self._wait_for_free_port():
+            print(f'Warning: port {self.port} still in use after stopping the server')
 
     def _wait_for_server(self, timeout: int | None = None):
         """Wait for the server to be ready to accept connections."""
@@ -286,10 +305,53 @@ def lan_page(lan_context):
             open_page.close()
 
 
+#: Errors raised when the server closed the connection before reading the
+#: request: the socket was gone, so nothing reached a route handler.
+HANG_UP_ERRORS = ('socket hang up', 'ECONNRESET', 'other side closed')
+
+#: The verbs :class:`RetryingAPIRequestContext` retries.
+HTTP_METHODS = frozenset({'delete', 'fetch', 'get', 'head', 'patch', 'post', 'put'})
+
+
+class RetryingAPIRequestContext:
+    """An API request context that sends a hung-up request a second time.
+
+    The context is session-scoped and keeps its connection pooled, while
+    the server closes a keep-alive connection it has heard nothing on for
+    a few seconds. A test that drives the browser for longer than that
+    leaves the two disagreeing about whether the connection is still
+    open, and the next request loses the race: it goes out just as the
+    close lands and fails with a socket hang up. The retry gets a fresh
+    connection; it cannot repeat work the server did, because a hang up
+    means the request was never read.
+    """
+
+    def __init__(self, context: APIRequestContext):
+        self._context = context
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._context, name)
+        if name not in HTTP_METHODS:
+            return attribute
+        return self._retrying(attribute)
+
+    @staticmethod
+    def _retrying(method):
+        def send(*args, **kwargs):
+            try:
+                return method(*args, **kwargs)
+            except PlaywrightError as error:
+                if not any(hang_up in error.message for hang_up in HANG_UP_ERRORS):
+                    raise
+            return method(*args, **kwargs)
+
+        return send
+
+
 @pytest.fixture(scope='session')
 def api_request_context(
     playwright: Playwright,
 ) -> Generator[APIRequestContext, None, None]:
     request_context = playwright.request.new_context(base_url='http://127.0.0.1:9000')
-    yield request_context
+    yield cast(APIRequestContext, RetryingAPIRequestContext(request_context))
     request_context.dispose()
